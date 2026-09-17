@@ -3,13 +3,8 @@ import { Telegraf } from "telegraf";
 
 console.log("=== Bot starting ===");
 
-if (!process.env.TELEGRAM_BOT_TOKEN) {
-  console.error("Missing TELEGRAM_BOT_TOKEN");
-  process.exit(1);
-}
-
-if (!process.env.RPC_URL || !process.env.RPC_URL.startsWith("https://")) {
-  console.error("Missing or invalid RPC_URL (must start with https://)");
+if (!process.env.TELEGRAM_BOT_TOKEN || !process.env.RPC_URL) {
+  console.error("Missing TELEGRAM_BOT_TOKEN or RPC_URL");
   process.exit(1);
 }
 
@@ -25,26 +20,25 @@ bot.catch((err) => console.error("Telegram error:", err.message));
 bot.command("start", (ctx) => {
   ctx.reply(
     "Bot is online!\n\n" +
-    "Commands:\n" +
-    "/watch <CA> – start watching a token\n" +
+    "/watch <CA> – watch a token\n" +
     "/unwatch <CA> – stop watching\n" +
     "/list – show watched tokens"
   );
 });
 
 bot.command("watch", async (ctx) => {
-  const mint = ctx.message.text.split(" ")[1];
+  const mint = ctx.message.text.split(" ")[1]?.trim();
   if (!mint || mint.length < 30) {
     return ctx.reply("Usage: /watch <contract_address>");
   }
   watchedMints.add(mint);
   userChats.set(mint, ctx.chat.id);
-  await ctx.reply(`✅ Now watching:\n${mint}`);
-  console.log("Watching:", mint);
+  await ctx.reply(`✅ Now watching:\n\`${mint}\``, { parse_mode: "Markdown" });
+  console.log("Added watch:", mint);
 });
 
 bot.command("unwatch", (ctx) => {
-  const mint = ctx.message.text.split(" ")[1];
+  const mint = ctx.message.text.split(" ")[1]?.trim();
   if (!mint) return ctx.reply("Usage: /unwatch <CA>");
   watchedMints.delete(mint);
   userChats.delete(mint);
@@ -53,50 +47,57 @@ bot.command("unwatch", (ctx) => {
 
 bot.command("list", (ctx) => {
   if (watchedMints.size === 0) return ctx.reply("No tokens being watched.");
-  ctx.reply([...watchedMints].join("\n"));
+  ctx.reply("Currently watching:\n" + [...watchedMints].map(m => `\`${m}\``).join("\n"), {
+    parse_mode: "Markdown"
+  });
 });
 
-// Listen for Pump.fun logs
+// Listen for logs
 connection.onLogs(
   PUMP_PROGRAM_ID,
   async (logInfo) => {
     try {
-      if (logInfo.err) return;
+      if (logInfo.err || watchedMints.size === 0) return;
 
-      // Simple detection for now (we will improve it later)
-      const logs = logInfo.logs.join("\n");
-      
-      // Look for distribution-related logs
-      if (logs.includes("DistributeFeeToHolders") || logs.includes("distribute_fee_to_holders")) {
-        console.log("Possible distribution detected:", logInfo.signature);
-        
-        // Notify all watched tokens for now (basic version)
-        for (const [mint, chatId] of userChats) {
+      const fullLogs = logInfo.logs.join(" ");
+
+      // Look for the distribution instruction
+      if (
+        fullLogs.includes("Instruction: DistributeFeeToHolders") ||
+        fullLogs.includes("distribute_fee_to_holders") ||
+        fullLogs.includes("DistributeFeeToHolders")
+      ) {
+        console.log("Distribution event found:", logInfo.signature);
+
+        // Notify everyone who is watching any token
+        // (We will make it more precise later)
+        for (const [mint, chatId] of userChats.entries()) {
           try {
             await bot.telegram.sendMessage(
               chatId,
-              `🚨 Possible Holder Rewards distribution detected!\n\n` +
-              `Tx: https://solscan.io/tx/${logInfo.signature}\n` +
-              `Watched token: ${mint}`
+              `🚨 *Holder Rewards Distribution Detected!*\n\n` +
+              `Token: \`${mint}\`\n` +
+              `Tx: https://solscan.io/tx/${logInfo.signature}`,
+              { parse_mode: "Markdown", disable_web_page_preview: true }
             );
           } catch (e) {
-            console.error("Failed to send message:", e.message);
+            console.error("Send failed:", e.message);
           }
         }
       }
     } catch (err) {
-      console.error("Log error:", err.message);
+      console.error("Log processing error:", err.message);
     }
   },
   "confirmed"
 );
 
-console.log("Listening for Pump.fun logs...");
+console.log("Listening for Pump.fun distributions...");
 
 bot.launch()
-  .then(() => console.log("✅ Telegram bot is ONLINE and listening"))
+  .then(() => console.log("✅ Bot is ONLINE and listening"))
   .catch((err) => {
-    console.error("Bot launch failed:", err.message);
+    console.error("Launch error:", err.message);
     process.exit(1);
   });
 
