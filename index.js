@@ -1,16 +1,10 @@
 import { Connection, PublicKey } from "@solana/web3.js";
 import { Telegraf } from "telegraf";
 
-console.log("=== Pump Holder Rewards Bot starting ===");
+console.log("=== Pump.fun Holder Rewards Bot ===");
 
-if (
-  !process.env.TELEGRAM_BOT_TOKEN ||
-  !process.env.RPC_URL ||
-  !process.env.WATCHED_WALLET
-) {
-  console.error(
-    "Missing TELEGRAM_BOT_TOKEN, RPC_URL, or WATCHED_WALLET"
-  );
+if (!process.env.TELEGRAM_BOT_TOKEN || !process.env.RPC_URL) {
+  console.error("Missing TELEGRAM_BOT_TOKEN or RPC_URL");
   process.exit(1);
 }
 
@@ -18,349 +12,426 @@ const PUMP_PROGRAM_ID = new PublicKey(
   "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 );
 
-const SYSTEM_PROGRAM_ID = new PublicKey(
-  "11111111111111111111111111111111"
-);
-
-const WATCHED_WALLET = new PublicKey(process.env.WATCHED_WALLET);
-
-const watchedMints = new Set();
-const userChats = new Map();
-
 const connection = new Connection(process.env.RPC_URL, {
   commitment: "processed",
 });
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 
-bot.catch((err) => {
-  console.error("Telegram error:", err.message);
-});
+// CA -> Set of Telegram chat IDs
+const watchedMints = new Map();
 
-/* ---------------- TELEGRAM ---------------- */
+// Prevent duplicate notifications for the same transaction
+const processedSignatures = new Set();
+
+/* =========================================================
+   TELEGRAM COMMANDS
+   ========================================================= */
+
+bot.catch((err) => {
+  console.error("Telegram error:", err);
+});
 
 bot.command("start", async (ctx) => {
   await ctx.reply(
-    "🟢 Pump Holder Rewards Bot is online!\n\n" +
-    "/watch <CA> – watch a token\n" +
-    "/unwatch <CA> – stop watching\n" +
-    "/list – show watched tokens\n" +
-    "/wallet – show watched wallet"
-  );
-});
-
-bot.command("wallet", async (ctx) => {
-  await ctx.reply(
-    `👛 Watched wallet:\n${WATCHED_WALLET.toBase58()}`
+    "🟢 Pump.fun Holder Rewards Bot is online!\n\n" +
+      "/watch <CA> – watch a token\n" +
+      "/unwatch <CA> – stop watching\n" +
+      "/list – show watched tokens"
   );
 });
 
 bot.command("watch", async (ctx) => {
-  const mint = ctx.message.text.split(" ")[1]?.trim();
+  const parts = ctx.message.text.trim().split(/\s+/);
+  const mintString = parts[1];
 
-  if (!mint) {
+  if (!mintString) {
     return ctx.reply("Usage: /watch <contract_address>");
   }
 
+  let mint;
+
   try {
-    new PublicKey(mint);
+    mint = new PublicKey(mintString);
   } catch {
-    return ctx.reply("❌ Invalid Solana address.");
+    return ctx.reply("❌ Invalid Solana contract address.");
   }
 
-  watchedMints.add(mint);
-  userChats.set(mint, ctx.chat.id);
+  const normalizedMint = mint.toBase58();
+  const chatId = ctx.chat.id;
 
-  await ctx.reply(
-    `✅ Now watching:\n\`${mint}\``,
-    { parse_mode: "Markdown" }
+  if (!watchedMints.has(normalizedMint)) {
+    watchedMints.set(normalizedMint, new Set());
+  }
+
+  watchedMints.get(normalizedMint).add(chatId);
+
+  console.log(
+    `Watching ${normalizedMint} for Telegram chat ${chatId}`
   );
 
-  console.log("Added watch:", mint);
+  await ctx.reply(
+    `✅ Now watching:\n\`${normalizedMint}\`\n\n` +
+      `I'll notify you whenever Pump.fun distributes holder fees for this CA.`,
+    {
+      parse_mode: "Markdown",
+    }
+  );
 });
 
 bot.command("unwatch", async (ctx) => {
-  const mint = ctx.message.text.split(" ")[1]?.trim();
+  const parts = ctx.message.text.trim().split(/\s+/);
+  const mintString = parts[1];
 
-  if (!mint) {
+  if (!mintString) {
     return ctx.reply("Usage: /unwatch <CA>");
   }
 
-  watchedMints.delete(mint);
-  userChats.delete(mint);
+  let normalizedMint;
 
-  await ctx.reply(`Stopped watching ${mint}`);
+  try {
+    normalizedMint = new PublicKey(mintString).toBase58();
+  } catch {
+    return ctx.reply("❌ Invalid Solana contract address.");
+  }
+
+  const chatId = ctx.chat.id;
+
+  if (!watchedMints.has(normalizedMint)) {
+    return ctx.reply("That CA isn't being watched.");
+  }
+
+  const chats = watchedMints.get(normalizedMint);
+
+  chats.delete(chatId);
+
+  if (chats.size === 0) {
+    watchedMints.delete(normalizedMint);
+  }
+
+  await ctx.reply(`Stopped watching:\n${normalizedMint}`);
 });
 
 bot.command("list", async (ctx) => {
   if (watchedMints.size === 0) {
-    return ctx.reply("No tokens being watched.");
+    return ctx.reply("No tokens are currently being watched.");
   }
 
-  await ctx.reply(
-    "Currently watching:\n" +
-      [...watchedMints]
-        .map((m) => `\`${m}\``)
-        .join("\n"),
-    { parse_mode: "Markdown" }
-  );
+  let message = "👀 Currently watching:\n\n";
+
+  for (const [mint, chats] of watchedMints.entries()) {
+    message += `\`${mint}\` — ${chats.size} watcher(s)\n`;
+  }
+
+  await ctx.reply(message, {
+    parse_mode: "Markdown",
+  });
 });
 
-/* ---------------- HELPERS ---------------- */
+/* =========================================================
+   FETCH TRANSACTION
+   ========================================================= */
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+async function getTransactionWithRetry(signature) {
+  // At "processed", the log can arrive slightly before
+  // the RPC makes the full transaction available.
 
-async function getTransactionFast(signature) {
-  // Try immediately at processed.
-  for (let i = 0; i < 5; i++) {
+  for (let attempt = 0; attempt < 10; attempt++) {
     try {
-      const tx = await connection.getParsedTransaction(signature, {
-        commitment: "processed",
-        maxSupportedTransactionVersion: 0,
-      });
+      const tx = await connection.getParsedTransaction(
+        signature,
+        {
+          commitment: "processed",
+          maxSupportedTransactionVersion: 0,
+        }
+      );
 
       if (tx) {
         return tx;
       }
     } catch (err) {
       console.error(
-        "getParsedTransaction error:",
+        `Transaction fetch attempt ${attempt + 1} failed:`,
         err.message
       );
     }
 
     // Very short retry.
-    await sleep(50);
+    await new Promise((resolve) => setTimeout(resolve, 50));
   }
 
   return null;
 }
 
-function isDistributionInstruction(ix) {
-  return (
-    ix &&
-    ix.programId &&
-    ix.programId.equals(PUMP_PROGRAM_ID) &&
-    ix.accounts &&
-    ix.accounts.length >= 3
-  );
+/* =========================================================
+   FIND DISTRIBUTE_FEE_TO_HOLDERS INSTRUCTION
+   ========================================================= */
+
+function findDistributionInstruction(tx) {
+  const instructions =
+    tx?.transaction?.message?.instructions || [];
+
+  for (const instruction of instructions) {
+    if (!instruction.programId) continue;
+
+    if (!instruction.programId.equals(PUMP_PROGRAM_ID)) {
+      continue;
+    }
+
+    /*
+     * Pump.fun DistributeFeeToHolders account layout:
+
+       #1 Global
+       #2 Holder Reward Claim Authority
+       #3 Mint
+       #4 Holder Rewards
+       #5 Holder Rewards Token Account
+       #6 Quote Mint
+       ...
+
+     * Therefore accounts[2] = MINT
+     */
+
+    if (
+      instruction.accounts &&
+      instruction.accounts.length >= 3
+    ) {
+      return instruction;
+    }
+  }
+
+  return null;
 }
 
-/* ---------------- PUMP LOG LISTENER ---------------- */
+/* =========================================================
+   GET SOL DISTRIBUTION INFORMATION
+   ========================================================= */
+
+function getDistributionTransfers(tx) {
+  const transfers = [];
+
+  const innerInstructions =
+    tx?.meta?.innerInstructions || [];
+
+  for (const inner of innerInstructions) {
+    for (const instruction of inner.instructions || []) {
+      if (!instruction.parsed) continue;
+
+      if (
+        instruction.program === "system" &&
+        instruction.parsed.type === "transfer"
+      ) {
+        const info = instruction.parsed.info;
+
+        if (
+          info &&
+          info.source &&
+          info.destination &&
+          info.lamports !== undefined
+        ) {
+          transfers.push({
+            source: info.source,
+            destination: info.destination,
+            lamports: Number(info.lamports),
+          });
+        }
+      }
+    }
+  }
+
+  return transfers;
+}
+
+/* =========================================================
+   PUMP.FUN LOG LISTENER
+   ========================================================= */
 
 connection.onLogs(
   PUMP_PROGRAM_ID,
+
   async (logInfo) => {
     try {
-      if (logInfo.err) return;
+      if (logInfo.err) {
+        return;
+      }
 
       const logs = logInfo.logs || [];
 
-      const isDistribution = logs.some((log) =>
+      /*
+       * We only care about the actual holder-fee distribution.
+       */
+      const isHolderDistribution = logs.some((log) =>
         log.includes("Instruction: DistributeFeeToHolders")
       );
 
-      if (!isDistribution) return;
+      if (!isHolderDistribution) {
+        return;
+      }
 
       const signature = logInfo.signature;
 
+      /*
+       * Don't process the same transaction twice.
+       */
+      if (processedSignatures.has(signature)) {
+        return;
+      }
+
+      processedSignatures.add(signature);
+
       console.log(
-        `⚡ Holder distribution detected: ${signature}`
+        `⚡ HOLDER DISTRIBUTION DETECTED: ${signature}`
       );
 
-      const tx = await getTransactionFast(signature);
+      /*
+       * Get the actual transaction so we can identify
+       * which CA/mint distributed the fees.
+       */
+      const tx = await getTransactionWithRetry(signature);
 
       if (!tx) {
-        console.log(
-          "Could not fetch transaction quickly:",
+        console.error(
+          "Could not retrieve transaction:",
           signature
         );
         return;
       }
 
-      /*
-       * Find the Pump distribution instruction.
-       *
-       * Account layout from the real transaction you provided:
-       *
-       * #1 Global
-       * #2 Holder Reward Claim Authority
-       * #3 Mint
-       * #4 Holder Rewards
-       * #5 Holder Rewards Token Account
-       * ...
-       * #12 recipient 1
-       * #13 recipient 1 ATA
-       * #14 recipient 2
-       * #15 recipient 2 ATA
-       */
+      const distributionInstruction =
+        findDistributionInstruction(tx);
 
-      let distributionIx = null;
-
-      for (const ix of tx.transaction.message.instructions) {
-        if (isDistributionInstruction(ix)) {
-          distributionIx = ix;
-          break;
-        }
-      }
-
-      if (!distributionIx) {
+      if (!distributionInstruction) {
         console.log(
-          "Distribution log found but instruction not found."
-        );
-        return;
-      }
-
-      const mint = distributionIx.accounts[2].toBase58();
-
-      console.log("Distribution mint:", mint);
-
-      // Ignore tokens we're not watching.
-      if (!watchedMints.has(mint)) {
-        console.log("Mint isn't being watched.");
-        return;
-      }
-
-      /*
-       * Find inner SOL transfers.
-       *
-       * The actual transaction you showed has:
-       *
-       * Holder Rewards PDA
-       *       ↓
-       * recipient wallet
-       *
-       * Holder Rewards PDA
-       *       ↓
-       * recipient wallet
-       */
-
-      const transfers = [];
-
-      if (tx.meta?.innerInstructions) {
-        for (const inner of tx.meta.innerInstructions) {
-          for (const ix of inner.instructions) {
-            if (!ix.parsed) continue;
-
-            if (
-              ix.program === "system" &&
-              ix.parsed.type === "transfer"
-            ) {
-              const info = ix.parsed.info;
-
-              if (
-                info?.source &&
-                info?.destination &&
-                info?.lamports
-              ) {
-                transfers.push({
-                  source: info.source,
-                  destination: info.destination,
-                  lamports: Number(info.lamports),
-                });
-              }
-            }
-          }
-        }
-      }
-
-      if (transfers.length === 0) {
-        console.log(
-          "Distribution found but no SOL transfers detected."
+          "Distribution log found but Pump instruction wasn't found."
         );
         return;
       }
 
       /*
-       * Check whether YOUR wallet received one of the payouts.
+       * Account #3 is the mint.
+       *
+       * JS array index = 2
        */
+      const mint = distributionInstruction.accounts[2].toBase58();
 
-      const walletString = WATCHED_WALLET.toBase58();
+      console.log(`🪙 Distribution mint: ${mint}`);
 
-      const myReward = transfers.find(
-        (transfer) =>
-          transfer.destination === walletString
+      /*
+       * IMPORTANT:
+       *
+       * Only notify if this exact CA is being watched.
+       */
+      const watchers = watchedMints.get(mint);
+
+      if (!watchers || watchers.size === 0) {
+        console.log(
+          `Ignoring ${mint} — nobody is watching this CA.`
+        );
+        return;
+      }
+
+      /*
+       * Find the actual SOL transfers.
+       */
+      const transfers = getDistributionTransfers(tx);
+
+      const totalLamports = transfers.reduce(
+        (sum, transfer) => sum + transfer.lamports,
+        0
       );
 
-      if (!myReward) {
-        console.log(
-          "Distribution happened, but watched wallet was not a recipient."
-        );
-        return;
-      }
-
-      const solAmount =
-        myReward.lamports / 1_000_000_000;
+      const totalSol = totalLamports / 1_000_000_000;
 
       console.log(
-        `💰 REWARD FOUND: ${solAmount} SOL`
+        `💰 ${mint} distributed ${totalSol} SOL`
       );
 
-      const chatId = userChats.get(mint);
+      console.log(
+        `👥 Recipients: ${transfers.length}`
+      );
 
-      if (!chatId) {
-        console.log(
-          "Wallet received reward, but nobody is watching this mint in Telegram."
-        );
-        return;
-      }
-
+      /*
+       * Build Telegram notification.
+       */
       const message =
-        `🚨 *HOLDER REWARD RECEIVED*\n\n` +
-        `🪙 Token:\n\`${mint}\`\n\n` +
-        `💰 Reward: *${solAmount.toFixed(9)} SOL*\n\n` +
-        `⚡ Detected at: *processed*\n` +
+        `🚨 *HOLDER FEES DISTRIBUTED*\n\n` +
+        `🪙 CA:\n\`${mint}\`\n\n` +
+        `💰 Total: *${totalSol.toFixed(9)} SOL*\n` +
+        `👥 Recipients: *${transfers.length}*\n\n` +
+        `⚡ Detected: *processed*\n` +
         `🔗 [Transaction](https://solscan.io/tx/${signature})`;
 
-      await bot.telegram.sendMessage(
-        chatId,
-        message,
-        {
-          parse_mode: "Markdown",
-          disable_web_page_preview: true,
-        }
-      );
+      /*
+       * Send to every Telegram user watching this CA.
+       */
+      for (const chatId of watchers) {
+        try {
+          await bot.telegram.sendMessage(
+            chatId,
+            message,
+            {
+              parse_mode: "Markdown",
+              disable_web_page_preview: true,
+            }
+          );
 
-      console.log(
-        `✅ Telegram notification sent for ${mint}`
-      );
+          console.log(
+            `✅ Telegram notification sent to ${chatId}`
+          );
+        } catch (err) {
+          console.error(
+            `Telegram send failed for ${chatId}:`,
+            err.message
+          );
+        }
+      }
     } catch (err) {
       console.error(
-        "Distribution processing error:",
+        "Holder distribution processing error:",
         err
       );
     }
   },
+
+  /*
+   * IMPORTANT:
+   *
+   * We use PROCESSED rather than CONFIRMED.
+   *
+   * You want the earliest notification possible.
+   */
   "processed"
 );
 
-/* ---------------- START ---------------- */
+/* =========================================================
+   START
+   ========================================================= */
 
 console.log(
-  `Watching wallet: ${WATCHED_WALLET.toBase58()}`
-);
-
-console.log(
-  "Listening for Pump.fun holder reward distributions..."
+  "Listening for Pump.fun DistributeFeeToHolders..."
 );
 
 bot
   .launch()
   .then(() => {
+    console.log("✅ Telegram bot is ONLINE");
     console.log(
-      "✅ Telegram bot is ONLINE"
+      "⚡ Listening at processed commitment"
     );
   })
   .catch((err) => {
     console.error(
-      "Launch error:",
+      "Telegram launch error:",
       err.message
     );
 
     process.exit(1);
   });
 
-process.once("SIGINT", () => bot.stop("SIGINT"));
-process.once("SIGTERM", () => bot.stop("SIGTERM"));
+process.once("SIGINT", () => {
+  bot.stop("SIGINT");
+});
+
+process.once("SIGTERM", () => {
+  bot.stop("SIGTERM");
+});
