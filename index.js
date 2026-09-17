@@ -21,30 +21,26 @@ if (!HELIUS_API_KEY) {
 const PUMP_PROGRAM_ID =
   "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 
-const WS_URL =
+const HELIUS_WS_URL =
   `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 
-const HTTP_URL =
+const HELIUS_HTTP_URL =
   `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 
 const watchedMints = new Map();
 
-let ws = null;
+let socket = null;
 let reconnectTimer = null;
 
 /* ======================================
-   TELEGRAM ERROR HANDLER
+   TELEGRAM
 ====================================== */
 
 bot.catch((err) => {
   console.error("❌ Telegram error:", err);
 });
-
-/* ======================================
-   /start
-====================================== */
 
 bot.command("start", async (ctx) => {
   await ctx.reply(
@@ -56,17 +52,9 @@ bot.command("start", async (ctx) => {
   );
 });
 
-/* ======================================
-   /test
-====================================== */
-
 bot.command("test", async (ctx) => {
   await ctx.reply("✅ Telegram is working.");
 });
-
-/* ======================================
-   /watch
-====================================== */
 
 bot.command("watch", async (ctx) => {
   const parts = ctx.message.text.trim().split(/\s+/);
@@ -105,10 +93,6 @@ bot.command("watch", async (ctx) => {
   );
 });
 
-/* ======================================
-   /unwatch
-====================================== */
-
 bot.command("unwatch", async (ctx) => {
   const parts = ctx.message.text.trim().split(/\s+/);
   const mint = parts[1];
@@ -136,10 +120,6 @@ bot.command("unwatch", async (ctx) => {
   );
 });
 
-/* ======================================
-   /list
-====================================== */
-
 bot.command("list", async (ctx) => {
   if (watchedMints.size === 0) {
     await ctx.reply(
@@ -166,26 +146,16 @@ bot.command("list", async (ctx) => {
 ====================================== */
 
 function connectWebSocket() {
-  console.log(
-    "🔌 Connecting to Helius WebSocket..."
-  );
+  console.log("🔌 Connecting to Helius WebSocket...");
 
-  ws = new WebSocket(WS_URL);
+  socket = new WebSocket(HELIUS_WS_URL);
 
-  ws.on("open", () => {
-    console.log(
-      "======================================"
-    );
+  socket.on("open", () => {
+    console.log("======================================");
+    console.log("✅ Helius WebSocket connected");
+    console.log("======================================");
 
-    console.log(
-      "✅ Helius WebSocket connected"
-    );
-
-    console.log(
-      "======================================"
-    );
-
-    const subscription = {
+    const subscriptionRequest = {
       jsonrpc: "2.0",
       id: 1,
       method: "logsSubscribe",
@@ -199,176 +169,113 @@ function connectWebSocket() {
       ]
     };
 
-    ws.send(
-      JSON.stringify(subscription)
+    socket.send(
+      JSON.stringify(subscriptionRequest)
     );
 
-    console.log(
-      "📡 Subscribed to Pump.fun logs"
-    );
-
-    console.log(
-      "⚡ Commitment: processed"
-    );
+    console.log("📡 Subscribed to Pump.fun logs");
+    console.log("⚡ Commitment: processed");
   });
 
-  ws.on("message", async (raw) => {
+  socket.on("message", async (rawData) => {
     try {
-      const wsMessage =
-        JSON.parse(raw.toString());
-
-      /*
-       * Subscription confirmation
-       */
+      const parsedData =
+        JSON.parse(rawData.toString());
 
       if (
-        wsMessage.result !== undefined &&
-        wsMessage.id === 1
+        parsedData.result !== undefined &&
+        parsedData.id === 1
       ) {
         console.log(
           "✅ Subscription ID:",
-          wsMessage.result
+          parsedData.result
         );
-
         return;
       }
 
-      /*
-       * Ignore non-log messages
-       */
-
       if (
-        wsMessage.method !==
+        parsedData.method !==
         "logsNotification"
       ) {
         return;
       }
 
-      const value =
-        wsMessage.params?.result?.value;
+      const logValue =
+        parsedData.params?.result?.value;
 
-      if (!value) {
+      if (!logValue) {
         return;
       }
 
-      if (value.err) {
+      if (logValue.err) {
         return;
       }
 
       const signature =
-        value.signature;
+        logValue.signature;
 
-      const logs =
-        value.logs || [];
+      const transactionLogs =
+        logValue.logs || [];
 
-      /*
-       * Look for the exact Pump.fun
-       * holder-fee distribution instruction.
-       */
-
-      const isDistribution =
-        logs.some((log) =>
-          log.includes(
+      const distributionDetected =
+        transactionLogs.some((logLine) =>
+          logLine.includes(
             "Instruction: DistributeFeeToHolders"
           )
         );
 
-      if (!isDistribution) {
+      if (!distributionDetected) {
         return;
       }
 
-      console.log(
-        "======================================"
-      );
-
-      console.log(
-        "🚨 DISTRIBUTE_FEE_TO_HOLDERS"
-      );
-
-      console.log(
-        "Signature:",
-        signature
-      );
-
-      console.log(
-        "======================================"
-      );
-
-      /*
-       * Get the transaction.
-       */
+      console.log("======================================");
+      console.log("🚨 DISTRIBUTE_FEE_TO_HOLDERS");
+      console.log("Signature:", signature);
+      console.log("======================================");
 
       const transaction =
-        await getTransaction(
-          signature
-        );
+        await getTransaction(signature);
 
       if (!transaction) {
         console.log(
           "❌ Transaction not available."
         );
-
         return;
       }
 
-      /*
-       * Find the mint.
-       */
-
       const mint =
-        getMintFromTransaction(
-          transaction
-        );
+        findMint(transaction);
 
       if (!mint) {
         console.log(
-          "❌ Couldn't determine mint."
+          "❌ Could not determine mint."
         );
-
         return;
       }
 
-      console.log(
-        "🪙 Distribution mint:",
-        mint
-      );
-
-      /*
-       * Only notify people watching
-       * THIS specific mint.
-       */
+      console.log("🪙 Mint:", mint);
 
       const watchers =
         watchedMints.get(mint);
 
-      if (
-        !watchers ||
-        watchers.size === 0
-      ) {
+      if (!watchers || watchers.size === 0) {
         console.log(
-          "ℹ️ CA isn't being watched."
+          "ℹ️ Mint is not currently being watched."
         );
-
         return;
       }
 
-      /*
-       * Get distribution information.
-       */
-
       const distribution =
-        getDistributionInfo(
-          transaction
-        );
+        calculateDistribution(transaction);
 
-      let telegramMessage =
+      let telegramText =
         "🚨 HOLDER FEES DISTRIBUTED\n\n" +
         "🪙 CA:\n" +
         mint +
         "\n\n";
 
       if (distribution) {
-        telegramMessage +=
+        telegramText +=
           "💰 Total: " +
           distribution.totalSol.toFixed(9) +
           " SOL\n" +
@@ -377,20 +284,16 @@ function connectWebSocket() {
           "\n\n";
       }
 
-      telegramMessage +=
+      telegramText +=
         "⚡ Detected: processed\n\n" +
         "🔗 https://solscan.io/tx/" +
         signature;
-
-      /*
-       * Send Telegram notification.
-       */
 
       for (const chatId of watchers) {
         try {
           await bot.telegram.sendMessage(
             chatId,
-            telegramMessage,
+            telegramText,
             {
               disable_web_page_preview: true
             }
@@ -408,20 +311,20 @@ function connectWebSocket() {
       }
     } catch (err) {
       console.error(
-        "❌ WebSocket message error:",
+        "❌ WebSocket processing error:",
         err
       );
     }
   });
 
-  ws.on("error", (err) => {
+  socket.on("error", (err) => {
     console.error(
       "❌ WebSocket error:",
       err.message
     );
   });
 
-  ws.on("close", () => {
+  socket.on("close", () => {
     console.log(
       "⚠️ Helius WebSocket disconnected"
     );
@@ -440,24 +343,21 @@ function connectWebSocket() {
 ====================================== */
 
 async function heliusRpc(
-  method,
-  params
+  methodName,
+  parameters
 ) {
   const response = await fetch(
-    HTTP_URL,
+    HELIUS_HTTP_URL,
     {
       method: "POST",
-
       headers: {
-        "Content-Type":
-          "application/json"
+        "Content-Type": "application/json"
       },
-
       body: JSON.stringify({
         jsonrpc: "2.0",
         id: 1,
-        method,
-        params
+        method: methodName,
+        params: parameters
       })
     }
   );
@@ -468,25 +368,23 @@ async function heliusRpc(
     );
   }
 
-  const data =
+  const rpcResult =
     await response.json();
 
-  if (data.error) {
+  if (rpcResult.error) {
     throw new Error(
-      data.error.message
+      rpcResult.error.message
     );
   }
 
-  return data.result;
+  return rpcResult.result;
 }
 
 /* ======================================
-   GET TRANSACTION
+   TRANSACTION LOOKUP
 ====================================== */
 
-async function getTransaction(
-  signature
-) {
+async function getTransaction(signature) {
   try {
     return await heliusRpc(
       "getTransaction",
@@ -513,23 +411,11 @@ async function getTransaction(
    FIND MINT
 ====================================== */
 
-function getMintFromTransaction(
-  transaction
-) {
+function findMint(transaction) {
   try {
     const instructions =
-      transaction.transaction
-        ?.message
+      transaction.transaction?.message
         ?.instructions || [];
-
-    /*
-     * Pump.fun distribution accounts:
-     *
-     * #1 Global
-     * #2 Holder Reward Claim Authority
-     * #3 Mint
-     * #4 Holder Rewards
-     */
 
     for (const instruction of instructions) {
       if (
@@ -554,16 +440,13 @@ function getMintFromTransaction(
 }
 
 /* ======================================
-   DISTRIBUTION INFORMATION
+   CALCULATE DISTRIBUTION
 ====================================== */
 
-function getDistributionInfo(
-  transaction
-) {
+function calculateDistribution(transaction) {
   try {
     const instructions =
-      transaction.transaction
-        ?.message
+      transaction.transaction?.message
         ?.instructions || [];
 
     let pumpInstruction = null;
@@ -575,9 +458,7 @@ function getDistributionInfo(
         instruction.accounts &&
         instruction.accounts.length >= 4
       ) {
-        pumpInstruction =
-          instruction;
-
+        pumpInstruction = instruction;
         break;
       }
     }
@@ -586,23 +467,16 @@ function getDistributionInfo(
       return null;
     }
 
-    /*
-     * Account #4 = Holder Rewards
-     */
-
     const holderRewards =
       pumpInstruction.accounts[3];
 
     const innerInstructions =
-      transaction.meta
-        ?.innerInstructions || [];
+      transaction.meta?.innerInstructions || [];
 
     let totalLamports = 0;
-    let recipients = 0;
+    let recipientCount = 0;
 
-    for (
-      const group of innerInstructions
-    ) {
+    for (const group of innerInstructions) {
       for (
         const instruction of
           group.instructions || []
@@ -612,24 +486,21 @@ function getDistributionInfo(
         }
 
         if (
-          instruction.program ===
-            "system" &&
-          instruction.parsed.type ===
-            "transfer"
+          instruction.program === "system" &&
+          instruction.parsed.type === "transfer"
         ) {
-          const info =
+          const transferInfo =
             instruction.parsed.info;
 
           if (
-            info &&
-            info.source ===
-              holderRewards &&
-            info.lamports
+            transferInfo &&
+            transferInfo.source === holderRewards &&
+            transferInfo.lamports
           ) {
             totalLamports +=
-              Number(info.lamports);
+              Number(transferInfo.lamports);
 
-            recipients++;
+            recipientCount++;
           }
         }
       }
@@ -637,14 +508,12 @@ function getDistributionInfo(
 
     return {
       totalSol:
-        totalLamports /
-        1000000000,
-
-      recipients
+        totalLamports / 1000000000,
+      recipients: recipientCount
     };
   } catch (err) {
     console.error(
-      "❌ Distribution parsing error:",
+      "❌ Distribution parsing failed:",
       err.message
     );
 
@@ -653,23 +522,14 @@ function getDistributionInfo(
 }
 
 /* ======================================
-   START
+   START BOT
 ====================================== */
 
-bot
-  .launch()
+bot.launch()
   .then(() => {
-    console.log(
-      "======================================"
-    );
-
-    console.log(
-      "✅ TELEGRAM BOT ONLINE"
-    );
-
-    console.log(
-      "======================================"
-    );
+    console.log("======================================");
+    console.log("✅ TELEGRAM BOT ONLINE");
+    console.log("======================================");
 
     connectWebSocket();
   })
