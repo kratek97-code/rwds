@@ -7,18 +7,8 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
-if (!TELEGRAM_BOT_TOKEN) {
-  console.error("Missing TELEGRAM_BOT_TOKEN");
-  process.exit(1);
-}
-
-if (!HELIUS_API_KEY) {
-  console.error("Missing HELIUS_API_KEY");
-  process.exit(1);
-}
-
-if (!TELEGRAM_CHAT_ID) {
-  console.error("Missing TELEGRAM_CHAT_ID");
+if (!TELEGRAM_BOT_TOKEN || !HELIUS_API_KEY || !TELEGRAM_CHAT_ID) {
+  console.error("❌ Missing Railway variable");
   process.exit(1);
 }
 
@@ -31,10 +21,9 @@ const RPC_URL =
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 
 let socket;
-let subscriptionId = null;
-let previousLamports = null;
 let reconnectTimer = null;
-const processedSignatures = new Set();
+
+const seen = new Set();
 
 console.log("======================================");
 console.log(" SOLANA WALLET TRANSFER MONITOR");
@@ -64,33 +53,27 @@ async function rpc(method, params) {
   return data.result;
 }
 
-async function getBalance() {
-  const result = await rpc("getBalance", [
-    WALLET,
-    { commitment: "processed" }
-  ]);
-
-  return result.value;
-}
-
-async function getRecentSignatures() {
-  return await rpc("getSignaturesForAddress", [
-    WALLET,
-    {
-      limit: 10
-    }
-  ]);
-}
-
 async function getTransaction(signature) {
-  return await rpc("getTransaction", [
-    signature,
-    {
-      commitment: "processed",
-      maxSupportedTransactionVersion: 0,
-      encoding: "jsonParsed"
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const tx = await rpc("getTransaction", [
+        signature,
+        {
+          commitment: "processed",
+          maxSupportedTransactionVersion: 0,
+          encoding: "jsonParsed"
+        }
+      ]);
+
+      if (tx) return tx;
+    } catch (err) {
+      console.error("RPC error:", err.message);
     }
-  ]);
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+
+  return null;
 }
 
 async function getSolPrice() {
@@ -101,35 +84,34 @@ async function getSolPrice() {
 
     const data = await response.json();
 
-    return Number(data.solana?.usd || 0);
-  } catch (err) {
-    console.error("SOL price error:", err.message);
+    return Number(data?.solana?.usd || 0);
+  } catch {
     return 0;
   }
 }
 
 function shorten(address) {
-  if (address.length <= 10) return address;
-  return address.slice(0, 4) + "..." + address.slice(-4);
+  return `${address.slice(0, 4)}...${address.slice(-4)}`;
 }
 
-function getIncomingSol(transaction) {
-  if (!transaction?.meta) return null;
+function getIncomingTransfer(tx) {
+  const message = tx?.transaction?.message;
 
-  const accountKeys =
-    transaction.transaction?.message?.accountKeys || [];
+  if (!message) return null;
+
+  const accountKeys = message.accountKeys || [];
 
   let walletIndex = -1;
 
   for (let i = 0; i < accountKeys.length; i++) {
     const key = accountKeys[i];
 
-    const pubkey =
+    const address =
       typeof key === "string"
         ? key
         : key.pubkey;
 
-    if (pubkey === WALLET) {
+    if (address === WALLET) {
       walletIndex = i;
       break;
     }
@@ -137,30 +119,9 @@ function getIncomingSol(transaction) {
 
   if (walletIndex === -1) return null;
 
-  const pre = transaction.meta.preBalances?.[walletIndex];
-  const post = transaction.meta.postBalances?.[walletIndex];
+  const instructions = message.instructions || [];
 
-  if (
-    typeof pre !== "number" ||
-    typeof post !== "number"
-  ) {
-    return null;
-  }
-
-  const difference = post - pre;
-
-  if (difference <= 0) return null;
-
-  const fee =
-    transaction.meta.fee || 0;
-
-  const transactionInstructions =
-    transaction.transaction?.message?.instructions || [];
-
-  let directTransfer = false;
-  let sender = null;
-
-  for (const instruction of transactionInstructions) {
+  for (const instruction of instructions) {
     if (
       instruction.program === "system" &&
       instruction.parsed?.type === "transfer"
@@ -168,102 +129,76 @@ function getIncomingSol(transaction) {
       const info = instruction.parsed.info;
 
       if (
-        info.destination === WALLET &&
+        info?.destination === WALLET &&
         Number(info.lamports) > 0
       ) {
-        directTransfer = true;
-        sender = info.source;
+        return {
+          lamports: Number(info.lamports),
+          sender: info.source
+        };
       }
     }
   }
 
-  if (!directTransfer) return null;
-
-  return {
-    lamports: difference,
-    sender,
-    fee
-  };
+  return null;
 }
 
-async function sendNotification(amountSol, sender, signature) {
-  const price = await getSolPrice();
-  const usd = amountSol * price;
+async function handleTransaction(signature) {
+  if (seen.has(signature)) return;
 
-  const senderText = sender
-    ? shorten(sender)
-    : "Unknown";
+  seen.add(signature);
+
+  if (seen.size > 500) {
+    seen.delete(seen.values().next().value);
+  }
+
+  console.log("📨 Wallet transaction:", signature);
+
+  const tx = await getTransaction(signature);
+
+  if (!tx) {
+    console.log("⏳ Transaction not available yet");
+    return;
+  }
+
+  if (tx.meta?.err) return;
+
+  const transfer = getIncomingTransfer(tx);
+
+  if (!transfer) {
+    console.log("↪️ Not an incoming SOL transfer");
+    return;
+  }
+
+  const sol = transfer.lamports / 1_000_000_000;
+
+  const price = await getSolPrice();
+
+  const usd = sol * price;
+
+  const sender = shorten(transfer.sender);
 
   const message =
-    `Received: **${amountSol.toFixed(3)}** #SOL ($${usd.toFixed(2)}) from [${senderText}]` +
+    `Received: **${sol.toFixed(3)}** #SOL ($${usd.toFixed(2)}) from [${sender}]` +
     `\n\n` +
     `[View TX](https://solscan.io/tx/${signature})`;
 
-  await bot.telegram.sendMessage(
-    TELEGRAM_CHAT_ID,
-    message,
-    {
-      parse_mode: "Markdown",
-      disable_web_page_preview: true
-    }
-  );
-
-  console.log("✅ Notification sent:", message);
-}
-
-async function findIncomingTransfer() {
   try {
-    const signatures = await getRecentSignatures();
-
-    for (const item of signatures) {
-      const signature = item.signature;
-
-      if (processedSignatures.has(signature)) {
-        continue;
+    await bot.telegram.sendMessage(
+      TELEGRAM_CHAT_ID,
+      message,
+      {
+        parse_mode: "Markdown",
+        disable_web_page_preview: true
       }
-
-      processedSignatures.add(signature);
-
-      const transaction =
-        await getTransaction(signature);
-
-      if (!transaction) continue;
-
-      if (transaction.meta?.err) continue;
-
-      const incoming =
-        getIncomingSol(transaction);
-
-      if (!incoming) continue;
-
-      const amountSol =
-        incoming.lamports / 1_000_000_000;
-
-      console.log("======================================");
-      console.log("🚨 INCOMING SOL");
-      console.log("Amount:", amountSol);
-      console.log("From:", incoming.sender);
-      console.log("Signature:", signature);
-      console.log("======================================");
-
-      await sendNotification(
-        amountSol,
-        incoming.sender,
-        signature
-      );
-    }
-
-    if (processedSignatures.size > 200) {
-      const first =
-        processedSignatures.values().next().value;
-
-      processedSignatures.delete(first);
-    }
-  } catch (err) {
-    console.error(
-      "Transfer detection error:",
-      err.message
     );
+
+    console.log("======================================");
+    console.log("✅ NOTIFICATION SENT");
+    console.log(message);
+    console.log("======================================");
+  } catch (err) {
+    console.error("❌ Telegram error:", err.message);
   }
 }
 
@@ -272,100 +207,61 @@ function connect() {
 
   socket = new WebSocket(WS_URL);
 
-  socket.on("open", async () => {
+  socket.on("open", () => {
     console.log("✅ Helius WebSocket connected");
-
-    try {
-      previousLamports = await getBalance();
-
-      console.log(
-        "Initial balance:",
-        previousLamports / 1_000_000_000,
-        "SOL"
-      );
-    } catch (err) {
-      console.error(
-        "Initial balance error:",
-        err.message
-      );
-    }
 
     socket.send(
       JSON.stringify({
         jsonrpc: "2.0",
         id: 1,
-        method: "accountSubscribe",
+        method: "logsSubscribe",
         params: [
-          WALLET,
           {
-            commitment: "processed",
-            encoding: "base64"
+            mentions: [WALLET]
+          },
+          {
+            commitment: "processed"
           }
         ]
       })
     );
 
-    console.log("📡 Account subscription sent");
+    console.log("📡 Wallet logs subscription sent");
   });
 
   socket.on("message", async (raw) => {
     try {
-      const data =
-        JSON.parse(raw.toString());
+      const data = JSON.parse(raw.toString());
 
-      if (
-        data.id === 1 &&
-        data.result !== undefined
-      ) {
-        subscriptionId = data.result;
-
-        console.log(
-          "✅ Account subscription active:",
-          subscriptionId
-        );
+      if (data.id === 1) {
+        if (data.error) {
+          console.error(
+            "❌ Subscription error:",
+            JSON.stringify(data.error)
+          );
+        } else {
+          console.log(
+            "✅ Wallet subscription active:",
+            data.result
+          );
+        }
 
         return;
       }
 
-      if (
-        data.method !== "accountNotification"
-      ) {
+      if (data.method !== "logsNotification") {
         return;
       }
 
-      const newLamports =
-        data.params?.result?.value?.lamports;
+      const value =
+        data.params?.result?.value;
 
-      if (
-        typeof newLamports !== "number"
-      ) {
-        return;
-      }
+      if (!value || value.err) return;
 
-      if (
-        previousLamports === null
-      ) {
-        previousLamports = newLamports;
-        return;
-      }
-
-      const increase =
-        newLamports - previousLamports;
-
-      console.log(
-        "Balance change:",
-        increase / 1_000_000_000,
-        "SOL"
-      );
-
-      if (increase > 0) {
-        await findIncomingTransfer();
-      }
-
-      previousLamports = newLamports;
+      await handleTransaction(value.signature);
     } catch (err) {
       console.error(
-        "WebSocket processing error:",
+        "❌ WebSocket processing error:",
         err.message
       );
     }
@@ -379,11 +275,7 @@ function connect() {
   });
 
   socket.on("close", () => {
-    console.log(
-      "⚠️ Helius disconnected"
-    );
-
-    subscriptionId = null;
+    console.log("⚠️ Helius disconnected");
 
     if (!reconnectTimer) {
       reconnectTimer = setTimeout(() => {
@@ -404,13 +296,9 @@ bot.launch()
       "❌ Telegram launch failed:",
       err.message
     );
+
     process.exit(1);
   });
 
-process.once("SIGINT", () => {
-  bot.stop("SIGINT");
-});
-
-process.once("SIGTERM", () => {
-  bot.stop("SIGTERM");
-});
+process.once("SIGINT", () => bot.stop("SIGINT"));
+process.once("SIGTERM", () => bot.stop("SIGTERM"));
