@@ -1,42 +1,42 @@
-import { Connection, PublicKey } from "@solana/web3.js";
+import WebSocket from "ws";
 import { Telegraf } from "telegraf";
 
 console.log("======================================");
-console.log(" Pump.fun Holder Rewards Bot");
+console.log(" Pump.fun Holder Fee Monitor");
 console.log("======================================");
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const RPC_URL = process.env.RPC_URL;
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 
 if (!TELEGRAM_BOT_TOKEN) {
   console.error("❌ Missing TELEGRAM_BOT_TOKEN");
   process.exit(1);
 }
 
-if (!RPC_URL) {
-  console.error("❌ Missing RPC_URL");
+if (!HELIUS_API_KEY) {
+  console.error("❌ Missing HELIUS_API_KEY");
   process.exit(1);
 }
 
 const PUMP_PROGRAM_ID =
   "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 
-const connection = new Connection(RPC_URL, {
-  commitment: "processed",
-});
+const WS_URL =
+  `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 
 /*
- * Map:
- * mint -> Set of Telegram chat IDs
+ * CA -> Telegram chat IDs
+ *
+ * Example:
+ *
+ * 9SLdx... -> Set(123456789)
  */
 const watchedMints = new Map();
 
-/*
- * Prevent duplicate alerts.
- */
-const alertedTransactions = new Set();
+let ws = null;
+let reconnectTimer = null;
 
 /*
  * ============================================================
@@ -51,82 +51,85 @@ bot.catch((err) => {
 bot.command("start", async (ctx) => {
   await ctx.reply(
     "🟢 Bot is online!\n\n" +
-      "Commands:\n" +
-      "/watch <CA> - watch a token\n" +
-      "/unwatch <CA> - stop watching\n" +
-      "/list - show watched tokens\n" +
-      "/test - test Telegram"
+    "/watch <CA> - watch a token\n" +
+    "/unwatch <CA> - stop watching\n" +
+    "/list - show watched tokens\n" +
+    "/test - test Telegram"
   );
 });
 
 bot.command("test", async (ctx) => {
   await ctx.reply(
-    "✅ Telegram is working.\n\n" +
-      "Now waiting for Pump.fun holder-fee distributions."
+    "✅ Telegram is working."
   );
 });
 
 bot.command("watch", async (ctx) => {
   const parts = ctx.message.text.trim().split(/\s+/);
-  const address = parts[1];
+  const mint = parts[1];
 
-  if (!address) {
-    await ctx.reply("Usage:\n/watch <CA>");
+  if (!mint) {
+    await ctx.reply(
+      "Usage:\n/watch <CA>"
+    );
     return;
   }
 
-  let mint;
-
-  try {
-    mint = new PublicKey(address).toBase58();
-  } catch {
-    await ctx.reply("❌ Invalid Solana address.");
+  /*
+   * Basic Solana address validation.
+   */
+  if (mint.length < 30 || mint.length > 50) {
+    await ctx.reply(
+      "❌ That doesn't look like a valid Solana CA."
+    );
     return;
   }
 
   if (!watchedMints.has(mint)) {
-    watchedMints.set(mint, new Set());
+    watchedMints.set(
+      mint,
+      new Set()
+    );
   }
 
-  watchedMints.get(mint).add(ctx.chat.id);
+  watchedMints
+    .get(mint)
+    .add(ctx.chat.id);
 
+  console.log("");
   console.log("======================================");
-  console.log("👀 NEW WATCH");
+  console.log("👀 WATCH ADDED");
   console.log("Mint:", mint);
   console.log("Chat:", ctx.chat.id);
   console.log("======================================");
 
   await ctx.reply(
-    "✅ Watching CA:\n\n" +
-      mint +
-      "\n\n" +
-      "I'll notify you when Pump.fun executes\n" +
-      "DistributeFeeToHolders for this CA."
+    "✅ Watching:\n\n" +
+    mint +
+    "\n\n" +
+    "I'll notify you when Pump.fun executes " +
+    "DistributeFeeToHolders for this CA."
   );
 });
 
 bot.command("unwatch", async (ctx) => {
   const parts = ctx.message.text.trim().split(/\s+/);
-  const address = parts[1];
+  const mint = parts[1];
 
-  if (!address) {
-    await ctx.reply("Usage:\n/unwatch <CA>");
+  if (!mint) {
+    await ctx.reply(
+      "Usage:\n/unwatch <CA>"
+    );
     return;
   }
 
-  let mint;
-
-  try {
-    mint = new PublicKey(address).toBase58();
-  } catch {
-    await ctx.reply("❌ Invalid Solana address.");
-    return;
-  }
-
-  const chats = watchedMints.get(mint);
+  const chats =
+    watchedMints.get(mint);
 
   if (!chats) {
-    await ctx.reply("That CA isn't being watched.");
+    await ctx.reply(
+      "That CA isn't being watched."
+    );
     return;
   }
 
@@ -137,196 +140,141 @@ bot.command("unwatch", async (ctx) => {
   }
 
   await ctx.reply(
-    "🛑 Stopped watching:\n\n" + mint
+    "🛑 Stopped watching:\n\n" +
+    mint
   );
 });
 
 bot.command("list", async (ctx) => {
   if (watchedMints.size === 0) {
-    await ctx.reply("No CAs are being watched.");
+    await ctx.reply(
+      "No CAs are currently being watched."
+    );
     return;
   }
 
-  let message = "👀 WATCHED CAs\n\n";
+  let text =
+    "👀 WATCHED CAs\n\n";
 
   for (const [mint, chats] of watchedMints) {
-    message += `${mint}\n`;
-    message += `Watchers: ${chats.size}\n\n`;
+    text +=
+      mint +
+      "\nWatchers: " +
+      chats.size +
+      "\n\n";
   }
 
-  await ctx.reply(message);
+  await ctx.reply(text);
 });
 
 /*
  * ============================================================
- * TRANSACTION FETCH
+ * WEBSOCKET
  * ============================================================
  */
 
-async function fetchTransaction(signature) {
-  for (let attempt = 0; attempt < 10; attempt++) {
-    try {
-      const tx =
-        await connection.getParsedTransaction(
-          signature,
-          {
-            commitment: "processed",
-            maxSupportedTransactionVersion: 0,
-          }
-        );
+function connectWebSocket() {
+  console.log("");
+  console.log(
+    "🔌 Connecting to Helius WebSocket..."
+  );
 
-      if (tx) {
-        return tx;
-      }
-    } catch (err) {
-      console.error(
-        "Transaction fetch error:",
-        err.message
-      );
-    }
+  ws = new WebSocket(WS_URL);
 
-    await new Promise((resolve) =>
-      setTimeout(resolve, 100)
+  ws.on("open", () => {
+    console.log(
+      "✅ Helius WebSocket connected"
     );
-  }
-
-  return null;
-}
-
-/*
- * ============================================================
- * FIND PUMP DISTRIBUTION INSTRUCTION
- * ============================================================
- */
-
-function findPumpDistribution(tx) {
-  const instructions =
-    tx?.transaction?.message?.instructions || [];
-
-  for (const ix of instructions) {
-    if (!ix.programId) continue;
-
-    if (
-      ix.programId.toBase58() !==
-      PUMP_PROGRAM_ID
-    ) {
-      continue;
-    }
 
     /*
-     * DistributeFeeToHolders has:
+     * Subscribe specifically to transactions/logs
+     * generated by Pump.fun.
      *
-     * accounts[0] = Global
-     * accounts[1] = Holder Reward Claim Authority
-     * accounts[2] = Mint
-     *
-     * Therefore accounts[2] is the CA.
+     * This is the important part.
      */
-
-    if (
-      ix.accounts &&
-      ix.accounts.length >= 3
-    ) {
-      return ix;
-    }
-  }
-
-  return null;
-}
-
-/*
- * ============================================================
- * GET SOL TRANSFERS
- * ============================================================
- */
-
-function getSolTransfers(tx) {
-  const transfers = [];
-
-  const inner =
-    tx?.meta?.innerInstructions || [];
-
-  for (const group of inner) {
-    for (const ix of group.instructions || []) {
-      if (!ix.parsed) continue;
-
-      if (
-        ix.program === "system" &&
-        ix.parsed.type === "transfer"
-      ) {
-        const info = ix.parsed.info;
-
-        if (
-          info &&
-          info.source &&
-          info.destination &&
-          info.lamports !== undefined
-        ) {
-          transfers.push({
-            source: info.source,
-            destination: info.destination,
-            lamports: Number(info.lamports),
-          });
+    const subscription = {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "logsSubscribe",
+      params: [
+        {
+          mentions: [
+            PUMP_PROGRAM_ID
+          ]
+        },
+        {
+          commitment: "processed"
         }
-      }
-    }
-  }
+      ]
+    };
 
-  return transfers;
-}
+    ws.send(
+      JSON.stringify(subscription)
+    );
 
-/*
- * ============================================================
- * PUMP.FUN LOG LISTENER
- * ============================================================
- *
- * TEMPORARILY listening to "all".
- *
- * This is intentional.
- *
- * We want to prove that Railway/RPC is actually receiving
- * Solana logs.
- */
+    console.log(
+      "📡 Subscribed to Pump.fun logs"
+    );
+    console.log(
+      "⚡ Commitment: processed"
+    );
+  });
 
-console.log("Connecting to Solana...");
-console.log("RPC:", RPC_URL.replace(/\/\/.*@/, "//***@"));
-console.log("Pump program:", PUMP_PROGRAM_ID);
-console.log("Commitment: processed");
-console.log("Starting log subscription...");
-
-connection.onLogs(
-  "all",
-
-  async (logInfo) => {
+  ws.on("message", async (raw) => {
     try {
-      /*
-       * Diagnostic.
-       *
-       * If Railway is working, you should see these constantly.
-       */
-      console.log(
-        "📡 LOG:",
-        logInfo.signature
-      );
+      const message =
+        JSON.parse(raw.toString());
 
-      if (logInfo.err) {
+      /*
+       * Subscription confirmation.
+       */
+      if (
+        message.result &&
+        message.id === 1
+      ) {
+        console.log(
+          "✅ Subscription ID:",
+          message.result
+        );
         return;
       }
 
-      const logs = logInfo.logs || [];
+      if (
+        message.method !==
+        "logsNotification"
+      ) {
+        return;
+      }
+
+      const value =
+        message.params?.result?.value;
+
+      if (!value) {
+        return;
+      }
+
+      if (value.err) {
+        return;
+      }
+
+      const signature =
+        value.signature;
+
+      const logs =
+        value.logs || [];
 
       /*
-       * Look specifically for the instruction from the
-       * real transaction you showed me.
+       * THIS is the exact instruction we confirmed
+       * from your Solscan transaction.
        */
+      const isHolderDistribution =
+        logs.some((log) =>
+          log.includes(
+            "Instruction: DistributeFeeToHolders"
+          )
+        );
 
-      const isDistribution = logs.some((log) =>
-        log.includes(
-          "Instruction: DistributeFeeToHolders"
-        )
-      );
-
-      if (!isDistribution) {
+      if (!isHolderDistribution) {
         return;
       }
 
@@ -335,72 +283,46 @@ connection.onLogs(
         "======================================"
       );
       console.log(
-        "🚨 HOLDER FEE DISTRIBUTION DETECTED"
+        "🚨 DISTRIBUTE_FEE_TO_HOLDERS"
+      );
+      console.log(
+        "Signature:",
+        signature
       );
       console.log(
         "======================================"
       );
-      console.log(
-        "Signature:",
-        logInfo.signature
-      );
-
-      const signature = logInfo.signature;
-
-      if (
-        alertedTransactions.has(signature)
-      ) {
-        return;
-      }
-
-      alertedTransactions.add(signature);
 
       /*
-       * Get the full transaction.
-       */
-
-      const tx =
-        await fetchTransaction(signature);
-
-      if (!tx) {
-        console.error(
-          "❌ Could not fetch transaction"
-        );
-        return;
-      }
-
-      /*
-       * Find the Pump instruction.
-       */
-
-      const instruction =
-        findPumpDistribution(tx);
-
-      if (!instruction) {
-        console.error(
-          "❌ Found distribution log but couldn't find Pump instruction"
-        );
-        return;
-      }
-
-      /*
-       * Account #3 = mint.
+       * At this point we KNOW a Pump.fun
+       * holder-fee distribution happened.
        *
-       * Array index 2 = account #3.
+       * Now we need to determine the mint.
+       *
+       * We use Helius' transaction RPC to fetch
+       * the transaction.
        */
 
       const mint =
-        instruction.accounts[2].toBase58();
+        await getMintFromTransaction(
+          signature
+        );
+
+      if (!mint) {
+        console.log(
+          "❌ Couldn't determine mint."
+        );
+        return;
+      }
 
       console.log(
-        "🪙 Mint:",
+        "🪙 Distribution mint:",
         mint
       );
 
       /*
-       * Only notify watchers of THIS CA.
+       * Is this CA being watched?
        */
-
       const watchers =
         watchedMints.get(mint);
 
@@ -409,113 +331,327 @@ connection.onLogs(
         watchers.size === 0
       ) {
         console.log(
-          "ℹ️ This CA isn't being watched."
+          "ℹ️ CA isn't being watched."
         );
-
         return;
       }
 
       /*
-       * Get actual SOL transfers.
+       * Get reward information.
        */
-
-      const transfers =
-        getSolTransfers(tx);
-
-      /*
-       * The distribution transaction can contain
-       * other system transfers, so we're interested
-       * in the transfers originating from the
-       * Holder Rewards account.
-       *
-       * Account #4 is the Holder Rewards account.
-       */
-
-      const holderRewardsAccount =
-        instruction.accounts[3].toBase58();
-
-      const rewardTransfers =
-        transfers.filter(
-          (transfer) =>
-            transfer.source ===
-            holderRewardsAccount
+      const distribution =
+        await getDistributionInfo(
+          signature,
+          mint
         );
 
-      let totalLamports = 0;
-
-      for (const transfer of rewardTransfers) {
-        totalLamports +=
-          transfer.lamports;
-      }
-
-      const totalSol =
-        totalLamports / 1_000_000_000;
-
-      console.log(
-        "💰 Total distributed:",
-        totalSol,
-        "SOL"
-      );
-
-      console.log(
-        "👥 Recipients:",
-        rewardTransfers.length
-      );
-
       /*
-       * Send Telegram.
+       * Notify Telegram.
        */
-
-      const message =
+      let message =
         "🚨 HOLDER FEES DISTRIBUTED\n\n" +
         "🪙 CA:\n" +
         mint +
-        "\n\n" +
-        "💰 Total distributed: " +
-        totalSol.toFixed(9) +
-        " SOL\n" +
-        "👥 Recipients: " +
-        rewardTransfers.length +
-        "\n\n" +
-        "⚡ Detected at: processed\n\n" +
+        "\n\n";
+
+      if (distribution) {
+        message +=
+          "💰 Total: " +
+          distribution.totalSol.toFixed(9) +
+          " SOL\n" +
+          "👥 Recipients: " +
+          distribution.recipients +
+          "\n\n";
+      }
+
+      message +=
+        "⚡ Detected: processed\n\n" +
         "🔗 https://solscan.io/tx/" +
         signature;
 
-      for (const chatId of watchers) {
+      for (
+        const chatId of watchers
+      ) {
         try {
           await bot.telegram.sendMessage(
             chatId,
             message,
             {
-              disable_web_page_preview: true,
+              disable_web_page_preview: true
             }
           );
 
           console.log(
-            "✅ Telegram notification sent to:",
-            chatId
+            "✅ Telegram notification sent"
           );
         } catch (err) {
           console.error(
-            "❌ Telegram send error:",
+            "❌ Telegram error:",
             err.message
           );
         }
       }
+
     } catch (err) {
       console.error(
-        "❌ Listener error:",
+        "❌ WebSocket message error:",
         err
       );
     }
-  },
+  });
 
-  "processed"
-);
+  ws.on("error", (err) => {
+    console.error(
+      "❌ WebSocket error:",
+      err.message
+    );
+  });
+
+  ws.on("close", () => {
+    console.log(
+      "⚠️ Helius WebSocket disconnected"
+    );
+
+    if (!reconnectTimer) {
+      reconnectTimer =
+        setTimeout(() => {
+          reconnectTimer = null;
+          connectWebSocket();
+        }, 2000);
+    }
+  });
+}
 
 /*
  * ============================================================
- * START TELEGRAM BOT
+ * GET TRANSACTION
+ * ============================================================
+ */
+
+async function heliusRpc(
+  method,
+  params
+) {
+  const response =
+    await fetch(
+      `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type":
+            "application/json"
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method,
+          params
+        })
+      }
+    );
+
+  const data =
+    await response.json();
+
+  if (data.error) {
+    throw new Error(
+      data.error.message
+    );
+  }
+
+  return data.result;
+}
+
+async function getMintFromTransaction(
+  signature
+) {
+  try {
+    const tx =
+      await heliusRpc(
+        "getTransaction",
+        [
+          signature,
+          {
+            commitment: "processed",
+            maxSupportedTransactionVersion: 0,
+            encoding: "jsonParsed"
+          }
+        ]
+      );
+
+    if (!tx) {
+      return null;
+    }
+
+    /*
+     * Pump.fun instruction is in the outer
+     * transaction instructions.
+     */
+    const instructions =
+      tx.transaction
+        ?.message
+        ?.instructions || [];
+
+    for (
+      const ix of instructions
+    ) {
+      if (
+        ix.programId ===
+        PUMP_PROGRAM_ID
+      ) {
+        /*
+         * Pump.fun instruction account #3
+         * is the Mint.
+         */
+        if (
+          ix.accounts &&
+          ix.accounts.length >= 3
+        ) {
+          return ix.accounts[2];
+        }
+      }
+    }
+
+    return null;
+
+  } catch (err) {
+    console.error(
+      "❌ Mint lookup failed:",
+      err.message
+    );
+
+    return null;
+  }
+}
+
+/*
+ * ============================================================
+ * GET DISTRIBUTION INFO
+ * ============================================================
+ */
+
+async function getDistributionInfo(
+  signature,
+  mint
+) {
+  try {
+    const tx =
+      await heliusRpc(
+        "getTransaction",
+        [
+          signature,
+          {
+            commitment: "processed",
+            maxSupportedTransactionVersion: 0,
+            encoding: "jsonParsed"
+          }
+        ]
+      );
+
+    if (!tx) {
+      return null;
+    }
+
+    /*
+     * Look for the Pump.fun instruction.
+     */
+    const instructions =
+      tx.transaction
+        ?.message
+        ?.instructions || [];
+
+    let pumpInstruction = null;
+
+    for (
+      const ix of instructions
+    ) {
+      if (
+        ix.programId ===
+        PUMP_PROGRAM_ID &&
+        ix.accounts &&
+        ix.accounts.length >= 4
+      ) {
+        pumpInstruction = ix;
+        break;
+      }
+    }
+
+    if (!pumpInstruction) {
+      return null;
+    }
+
+    /*
+     * Account #4 is the Holder Rewards account.
+     */
+    const holderRewards =
+      pumpInstruction.accounts[3];
+
+    /*
+     * Find inner System transfers.
+     */
+    const inner =
+      tx.meta
+        ?.innerInstructions || [];
+
+    let totalLamports = 0;
+    let recipients = 0;
+
+    for (
+      const group of inner
+    ) {
+      for (
+        const ix of
+        group.instructions || []
+      ) {
+        if (!ix.parsed) {
+          continue;
+        }
+
+        if (
+          ix.program === "system" &&
+          ix.parsed.type ===
+            "transfer"
+        ) {
+          const info =
+            ix.parsed.info;
+
+          if (
+            info?.source ===
+              holderRewards &&
+            info?.lamports
+          ) {
+            totalLamports +=
+              Number(
+                info.lamports
+              );
+
+            recipients++;
+          }
+        }
+      }
+    }
+
+    return {
+      totalSol:
+        totalLamports /
+        1_000_000_000,
+
+      recipients
+    };
+
+  } catch (err) {
+    console.error(
+      "Distribution info error:",
+      err.message
+    );
+
+    return null;
+  }
+}
+
+/*
+ * ============================================================
+ * START
  * ============================================================
  */
 
@@ -532,9 +668,8 @@ bot
     console.log(
       "======================================"
     );
-    console.log(
-      "Waiting for Pump.fun holder distributions..."
-    );
+
+    connectWebSocket();
   })
   .catch((err) => {
     console.error(
